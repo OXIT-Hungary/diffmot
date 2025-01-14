@@ -245,7 +245,9 @@ class STrack(BaseTrack):
 
 
 class diffmottracker(object):
-    def __init__(self, config, frame_rate=30):
+    def __init__(self, config, model, frame_rate=30):
+        self.model = model
+
         self.config = config
         self.tracked_stracks = []  # type: list[STrack]
         self.lost_stracks = []  # type: list[STrack]
@@ -267,40 +269,27 @@ class diffmottracker(object):
         # self.cmc.dump_cache()
         self.embedder.dump_cache()
 
-    def update(self, dets, model, frame_id, img_w, img_h, tag, img=None):
+    def update(self, dets, img_w, img_h, tag, img=None):
         dets = dets.cpu().numpy()
-        self.model = model
+
         self.frame_id += 1
         activated_starcks = []
         refind_stracks = []
         lost_stracks = []
         removed_stracks = []
-        # dets[:, 2] = dets[:, 0] + dets[:, 2]
-        # dets[:, 3] = dets[:, 1] + dets[:, 3]
-        remain_inds = dets[:, 5] > self.det_thresh
-        inds_low = dets[:, 5] > self.config.low_thres
-        inds_high = dets[:, 5] < self.det_thresh
-        inds_second = np.logical_and(inds_low, inds_high)
-        dets_second = dets[inds_second]
-        dets = dets[remain_inds]
+
+        dets = dets[dets[:, 5] > self.det_thresh]
+        dets_second = dets[np.logical_and(dets[:, 5] > self.config.low_thres, dets[:, 5] < self.det_thresh)]
 
         dets_embs = np.ones((dets.shape[0], 1))
         if dets.shape[0] != 0:
             dets_embs = self.embedder.compute_embedding(img, dets[:, :4], tag)
         trust = (dets[:, 5] - self.det_thresh) / (1 - self.det_thresh)
-        af = self.alpha_fixed_emb
-        # From [self.alpha_fixed_emb, 1], goes to 1 as detector is less confident
-        dets_alpha = af + (1 - af) * (1 - trust)
+        dets_alpha = self.alpha_fixed_emb + (1 - self.alpha_fixed_emb) * (1 - trust)
 
-        if len(dets) > 0:
-            """Detections"""
-            detections = [
-                STrack(STrack.tlbr_to_tlwh(tlbrs[:4]), int(tlbrs[4].item()), tlbrs[5], f, 30) for (tlbrs, f) in zip(dets, dets_embs)
-            ]
-        else:
-            detections = []
+        # Detections
+        detections = [STrack(tlwh=STrack.tlbr_to_tlwh(tlbrs[:4]), label=int(tlbrs[4].item()), score=tlbrs[5], temp_feat=f, buffer_size=30) for (tlbrs, f) in zip(dets, dets_embs)]
 
-        """ Add newly detected tracklets to tracked_stracks"""
         unconfirmed = []
         tracked_stracks = []  # type: list[STrack]
         for track in self.tracked_stracks:
@@ -309,16 +298,14 @@ class diffmottracker(object):
             else:
                 tracked_stracks.append(track)
 
-        """ Step 2: First association, with embedding"""
+        # Step 2: First association, with embeddig
         strack_pool = joint_stracks(tracked_stracks, self.lost_stracks)
         STrack.multi_predict_diff(strack_pool, self.model, img_w, img_h)
 
-        trk_embs = [st.emb for st in strack_pool]
-        trk_embs = np.array(trk_embs)
+        trk_embs = np.array([st.emb for st in strack_pool])
         emb_cost = None if (trk_embs.shape[0] == 0 or dets_embs.shape[0] == 0) else trk_embs @ dets_embs.T
 
-        dists = matching.iou_distance(strack_pool, detections)
-        iou_matrix = 1 - dists
+        iou_matrix = 1 - matching.iou_distance(strack_pool, detections)
 
         if min(iou_matrix.shape) > 0:
             a = (iou_matrix > 0.1).astype(np.int32)
@@ -327,10 +314,8 @@ class diffmottracker(object):
             else:
                 if emb_cost is None:
                     emb_cost = 0
-                w_assoc_emb = self.config.w_assoc_emb
-                aw_param = self.config.aw_param
 
-                w_matrix = matching.compute_aw_new_metric(emb_cost, w_assoc_emb, aw_param)
+                w_matrix = matching.compute_aw_new_metric(emb_cost, self.config.w_assoc_emb, self.config.aw_param)
                 emb_cost *= w_matrix
 
                 final_cost = -(iou_matrix + emb_cost)
@@ -338,14 +323,8 @@ class diffmottracker(object):
         else:
             matched_indices = np.empty(shape=(0, 2))
 
-        unmatched_detections = []
-        for d, det in enumerate(detections):
-            if d not in matched_indices[:, 1]:
-                unmatched_detections.append(d)
-        unmatched_trackers = []
-        for t, trk in enumerate(strack_pool):
-            if t not in matched_indices[:, 0]:
-                unmatched_trackers.append(t)
+        unmatched_detections = [d for d in range(len(detections)) if d not in matched_indices[:, 1]]
+        unmatched_trackers = [t for t in range(len(strack_pool)) if t not in matched_indices[:, 0]]
 
         # filter out matched with low IOU
         matches = []
@@ -355,13 +334,11 @@ class diffmottracker(object):
                 unmatched_trackers.append(m[0])
             else:
                 matches.append(m.reshape(1, 2))
+
         if len(matches) == 0:
             matches = np.empty((0, 2), dtype=int)
         else:
             matches = np.concatenate(matches, axis=0)
-
-        u_track = np.array(unmatched_trackers)
-        u_detection = np.array(unmatched_detections)
 
         for itracked, idet in matches:
             track = strack_pool[itracked]
@@ -376,17 +353,12 @@ class diffmottracker(object):
                 track.update_features(det.emb, alp)
                 refind_stracks.append(track)
 
-        if len(dets_second) > 0:
-            """Detections"""
-            detections_second = [
-                STrack(STrack.tlbr_to_tlwh(tlbrs[:4]), tlbrs[4], buffer_size=30) for (tlbrs) in dets_second[:, :5]
-            ]
-        else:
-            detections_second = []
+        # Detections
+        detections_second = [STrack(tlwh=STrack.tlbr_to_tlwh(det[:4]), label=int(det[4].item()), score=det[5], buffer_size=30) for det in dets_second]
 
-        r_tracked_stracks = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]
+        r_tracked_stracks = [strack_pool[i] for i in unmatched_trackers if strack_pool[i].state == TrackState.Tracked]
         dists = matching.iou_distance(r_tracked_stracks, detections_second)
-        matches, u_track, u_detection_second = matching.linear_assignment(dists, thresh=0.5)
+        matches, unmatched_trackers, u_detection_second = matching.linear_assignment(dists, thresh=0.5)
         for itracked, idet in matches:
             track = r_tracked_stracks[itracked]
             det = detections_second[idet]
@@ -397,17 +369,16 @@ class diffmottracker(object):
                 track.re_activate(det, self.frame_id, new_id=False)
                 refind_stracks.append(track)
 
-        for it in u_track:
-            # track = strack_pool[it]
+        for it in unmatched_trackers:
             track = r_tracked_stracks[it]
             if not track.state == TrackState.Lost:
                 track.mark_lost()
                 lost_stracks.append(track)
 
         """Deal with unconfirmed tracks, usually tracks with only one beginning frame"""
-        detections = [detections[i] for i in u_detection]
+        detections = [detections[i] for i in unmatched_detections]
         dists = matching.iou_distance(unconfirmed, detections)
-        matches, u_unconfirmed, u_detection = matching.linear_assignment(dists, thresh=0.7)
+        matches, u_unconfirmed, unmatched_detections = matching.linear_assignment(dists, thresh=0.7)
         for itracked, idet in matches:
             alp = dets_alpha[idet]
             unconfirmed[itracked].update(detections[idet], self.frame_id)
@@ -420,7 +391,7 @@ class diffmottracker(object):
             removed_stracks.append(track)
 
         """ Step 4: Init new stracks"""
-        for inew in u_detection:
+        for inew in unmatched_detections:
             track = detections[inew]
             if track.score < self.det_thresh:
                 continue
@@ -433,8 +404,7 @@ class diffmottracker(object):
                 track.mark_removed()
                 removed_stracks.append(track)
 
-        # print('Ramained match {} s'.format(t4-t3))
-
+        # TODO: Reimplement lifetime management and what tracks are given out
         self.tracked_stracks = [t for t in self.tracked_stracks if t.state == TrackState.Tracked]
         self.tracked_stracks = joint_stracks(self.tracked_stracks, activated_starcks)
         self.tracked_stracks = joint_stracks(self.tracked_stracks, refind_stracks)

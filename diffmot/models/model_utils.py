@@ -15,6 +15,6 @@ def get_diffmot(cfg) -> nn.Module:
 
     model.load_state_dict({k.replace("module.", ""): v for k, v in checkpoint["ddpm"].items()})
 
-    tracker = diffmot.tracker.diffmottracker(cfg.tracker)
+    tracker = diffmot.tracker.diffmottracker(config=cfg.tracker, model=model, frame_rate=30)
 
     return model, tracker
