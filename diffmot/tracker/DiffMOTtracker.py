@@ -22,28 +22,36 @@ from .gmc import GMC
 
 class STrack(BaseTrack):
     # shared_kalman = KalmanFilter()
-    def __init__(self, tlwh, label, score, temp_feat=None, buffer_size=30):
+    def __init__(self, tlwh, label, frame_id, temp_feat=None, buffer_size=30):
 
+        self._tlwh = tlwh
+        self.emb = temp_feat
         self.buffer_size = buffer_size
-        # wait activate
-        self.xywh_omemory = deque([], maxlen=buffer_size)
-        self.xywh_pmemory = deque([], maxlen=buffer_size)
-        self.xywh_amemory = deque([], maxlen=buffer_size)
-
-        self.conds = deque([], maxlen=5)
-
-        self._tlwh = np.asarray(tlwh, dtype=np.float32)
+        
         self.kalman_filter = None
         self.mean, self.covariance = None, None
         self.is_activated = False
 
-        self._label = label
-        self.label_memory = deque()
-        self.label_counter = Counter()
-        self.score = score
+        self.score = 10
+        self.score_thresh = 15
+
+        self.frame_id = frame_id
+        self.start_frame = frame_id
+
         self.tracklet_len = 0
 
-        self.emb = temp_feat
+        self.xywh_omemory = deque([self.xywh.copy()], maxlen=buffer_size)
+        self.xywh_pmemory = deque([self.xywh.copy()], maxlen=buffer_size)
+        self.xywh_amemory = deque([self.xywh.copy()], maxlen=buffer_size)
+
+        self.label_memory = deque([label])
+        self.label_counter = Counter()
+        self.label_counter[label] += 1
+
+        self.conds = deque([], maxlen=5)
+        tmp_conds = np.concatenate((self.xywh.copy(), self.xywh.copy() - self.xywh.copy()))
+        self.conds.append(tmp_conds)
+
         self.features = deque([], maxlen=buffer_size)
 
     def update_features(self, feat, alpha=0.95):
@@ -99,28 +107,6 @@ class STrack(BaseTrack):
                 tmp_conds = np.concatenate((st.xywh.copy(), tmp_delta_bbox))
                 st.conds.append(tmp_conds)
 
-    def activate(self, frame_id):
-        """Start a new tracklet"""
-        self.track_id = self.next_id()
-
-        self.tracklet_len = 0
-        self.state = TrackState.Tracked
-        if frame_id == 1:
-            self.is_activated = True
-
-        self.frame_id = frame_id
-        self.start_frame = frame_id
-        self.xywh_omemory.append(self.xywh.copy())
-        self.xywh_pmemory.append(self.xywh.copy())
-        self.xywh_amemory.append(self.xywh.copy())
-
-        self.label_memory.append(self._label)
-        self.label_counter[self._label] += 1
-
-        delta_bbox = self.xywh.copy() - self.xywh.copy()
-        tmp_conds = np.concatenate((self.xywh.copy(), delta_bbox))
-        self.conds.append(tmp_conds)
-
     def re_activate(self, new_track, frame_id, new_id=False):
         new_tlwh = new_track.tlwh
         self._tlwh = new_tlwh
@@ -138,7 +124,7 @@ class STrack(BaseTrack):
         if new_id:
             self.track_id = self.next_id()
 
-    def update(self, new_track, frame_id, update_feature=False):
+    def update(self, det, frame_id):
         """
         Update a matched track
         :type new_track: STrack
@@ -149,8 +135,12 @@ class STrack(BaseTrack):
         self.frame_id = frame_id
         self.tracklet_len += 1
 
-        new_tlwh = new_track.tlwh
-        self._tlwh = new_tlwh
+        self.score = min(self.score + 1, 30)
+        if self.score >= 15 and self.state == TrackState.New:
+            self.track_id = self.next_id()
+            self.state = TrackState.Tracked
+
+        self._tlwh = det.tlwh
         self.xywh_omemory.append(self.xywh.copy())
         self.xywh_amemory[-1] = self.xywh.copy()
 
@@ -163,22 +153,14 @@ class STrack(BaseTrack):
             tmp_conds = np.concatenate((self.xywh.copy(), tmp_delta_bbox))
             self.conds[-1] = tmp_conds
 
-        self.state = TrackState.Tracked
-        self.is_activated = True
+        self.label_memory.append(det.label)
+        self.label_counter[det.label] += 1
 
-        self.score = new_track.score
-
-        new_label = new_track.label
-        self.label_memory.append(new_label)
-        self.label_counter[new_label] += 1
         if len(self.label_memory) > self.buffer_size:
             oldest_value = self.label_memory.popleft()
             self.label_counter[oldest_value] -= 1
             if self.label_counter[oldest_value] == 0:
                 del self.label_counter[oldest_value]
-
-        if update_feature:
-            self.update_features(new_track.curr_feat)
 
     @property
     def label(self):
@@ -249,9 +231,8 @@ class diffmottracker(object):
         self.model = model
 
         self.config = config
-        self.tracked_stracks = []  # type: list[STrack]
-        self.lost_stracks = []  # type: list[STrack]
-        self.removed_stracks = []  # type: list[STrack]
+
+        self.tracks = []
 
         self.frame_id = 0
         self.det_thresh = self.config.high_thres
@@ -269,193 +250,86 @@ class diffmottracker(object):
         # self.cmc.dump_cache()
         self.embedder.dump_cache()
 
-    def update(self, dets, img_w, img_h, tag, img=None):
-        dets = dets.cpu().numpy()
+    def associate(self, detections, dets_embs):
+        if len(detections) > 0:
+            iou_matrix = 1 - matching.iou_distance(self.tracks, detections)
+            if min(iou_matrix.shape) > 0:
+                a = (iou_matrix > 0.1).astype(np.int32)
+                if a.sum(1).max() == 1 and a.sum(0).max() == 1:
+                    matched_indices = np.stack(np.where(a), axis=1)
+                else:
+                    track_embs = np.array([st.emb for st in self.tracks])
+                    emb_cost = 0 if (track_embs.shape[0] == 0 or dets_embs.shape[0] == 0) else track_embs @ dets_embs.T
+
+                    w_matrix = matching.compute_aw_new_metric(emb_cost, self.config.w_assoc_emb, self.config.aw_param)
+                    emb_cost *= w_matrix
+
+                    final_cost = -(iou_matrix + emb_cost)
+                    matched_indices = matching.linear_assignment2(final_cost)
+            else:
+                matched_indices = np.empty(shape=(0, 2))
+
+            unmatched_dets = [d for d in range(len(detections)) if d not in matched_indices[:, 1]]
+            unmatched_tracks = [t for t in range(len(self.tracks)) if t not in matched_indices[:, 0]]
+
+            # filter out matched with low IOU
+            matches = []
+            for m in matched_indices:
+                if iou_matrix[m[0], m[1]] < 0.1:
+                    unmatched_dets.append(m[1])
+                    unmatched_tracks.append(m[0])
+                else:
+                    matches.append(m.reshape(1, 2))
+
+            matches = np.concatenate(matches, axis=0) if len(matches) > 0 else np.empty((0, 2), dtype=int)
+
+        return matches, unmatched_dets, unmatched_tracks
+
+    def update(self, matches, detections, dets_alpha):
+        for ind_track, ind_det in matches:
+            track = self.tracks[ind_track]
+            det = detections[ind_det]
+            alp = dets_alpha[ind_det]
+
+            track.update(det, self.frame_id)
+            track.update_features(det.emb, alp)
+
+    def next(self, dets, img_w, img_h, tag, img=None):
 
         self.frame_id += 1
-        activated_starcks = []
-        refind_stracks = []
-        lost_stracks = []
-        removed_stracks = []
 
-        dets = dets[dets[:, 5] > self.det_thresh]
-        dets_second = dets[np.logical_and(dets[:, 5] > self.config.low_thres, dets[:, 5] < self.det_thresh)]
+        # Step 1: Propagate tracks
+        STrack.multi_predict_diff(self.tracks, self.model, img_w, img_h)
 
-        dets_embs = np.ones((dets.shape[0], 1))
-        if dets.shape[0] != 0:
-            dets_embs = self.embedder.compute_embedding(img, dets[:, :4], tag)
+        # Step 2: Associate
+        dets = dets[dets[:, 5] > self.det_thresh].cpu().numpy()
+        dets_embs = self.embedder.compute_embedding(img, dets[:, :4], tag) if dets.shape[0] != 0 else np.ones((dets.shape[0], 1))
+
+        detections = [
+            STrack(
+                tlwh=STrack.tlbr_to_tlwh(tlbrs[:4]),
+                label=int(tlbrs[4].item()),
+                frame_id=self.frame_id,
+                temp_feat=f,
+                buffer_size=30,
+            ) for (tlbrs, f) in zip(dets, dets_embs)]
+        
+        matches, unmatched_dets, unmatched_tracks = self.associate(detections=detections, dets_embs=dets_embs)
+
+        # Step 3: Update
         trust = (dets[:, 5] - self.det_thresh) / (1 - self.det_thresh)
         dets_alpha = self.alpha_fixed_emb + (1 - self.alpha_fixed_emb) * (1 - trust)
+        self.update(matches=matches, detections=detections, dets_alpha=dets_alpha)
 
-        # Detections
-        detections = [STrack(tlwh=STrack.tlbr_to_tlwh(tlbrs[:4]), label=int(tlbrs[4].item()), score=tlbrs[5], temp_feat=f, buffer_size=30) for (tlbrs, f) in zip(dets, dets_embs)]
+        # Step 4: Lifetime Management
+        for ind_track in unmatched_tracks:
+            self.tracks[ind_track].score -= 1
+            
+        self.tracks = [track for track in self.tracks if track.score > 0]
 
-        unconfirmed = []
-        tracked_stracks = []  # type: list[STrack]
-        for track in self.tracked_stracks:
-            if not track.is_activated:
-                unconfirmed.append(track)
-            else:
-                tracked_stracks.append(track)
+        # Step 5: Init new tracks
+        for ind_det in unmatched_dets:
+            self.tracks.append(detections[ind_det])
 
-        # Step 2: First association, with embeddig
-        strack_pool = joint_stracks(tracked_stracks, self.lost_stracks)
-        STrack.multi_predict_diff(strack_pool, self.model, img_w, img_h)
+        return [track for track in self.tracks if track.state == TrackState.Tracked]
 
-        trk_embs = np.array([st.emb for st in strack_pool])
-        emb_cost = None if (trk_embs.shape[0] == 0 or dets_embs.shape[0] == 0) else trk_embs @ dets_embs.T
-
-        iou_matrix = 1 - matching.iou_distance(strack_pool, detections)
-
-        if min(iou_matrix.shape) > 0:
-            a = (iou_matrix > 0.1).astype(np.int32)
-            if a.sum(1).max() == 1 and a.sum(0).max() == 1:
-                matched_indices = np.stack(np.where(a), axis=1)
-            else:
-                if emb_cost is None:
-                    emb_cost = 0
-
-                w_matrix = matching.compute_aw_new_metric(emb_cost, self.config.w_assoc_emb, self.config.aw_param)
-                emb_cost *= w_matrix
-
-                final_cost = -(iou_matrix + emb_cost)
-                matched_indices = matching.linear_assignment2(final_cost)
-        else:
-            matched_indices = np.empty(shape=(0, 2))
-
-        unmatched_detections = [d for d in range(len(detections)) if d not in matched_indices[:, 1]]
-        unmatched_trackers = [t for t in range(len(strack_pool)) if t not in matched_indices[:, 0]]
-
-        # filter out matched with low IOU
-        matches = []
-        for m in matched_indices:
-            if iou_matrix[m[0], m[1]] < 0.1:
-                unmatched_detections.append(m[1])
-                unmatched_trackers.append(m[0])
-            else:
-                matches.append(m.reshape(1, 2))
-
-        if len(matches) == 0:
-            matches = np.empty((0, 2), dtype=int)
-        else:
-            matches = np.concatenate(matches, axis=0)
-
-        for itracked, idet in matches:
-            track = strack_pool[itracked]
-            det = detections[idet]
-            alp = dets_alpha[idet]
-            if track.state == TrackState.Tracked:
-                track.update(det, self.frame_id)
-                track.update_features(det.emb, alp)
-                activated_starcks.append(track)
-            else:
-                track.re_activate(det, self.frame_id, new_id=False)
-                track.update_features(det.emb, alp)
-                refind_stracks.append(track)
-
-        # Detections
-        detections_second = [STrack(tlwh=STrack.tlbr_to_tlwh(det[:4]), label=int(det[4].item()), score=det[5], buffer_size=30) for det in dets_second]
-
-        r_tracked_stracks = [strack_pool[i] for i in unmatched_trackers if strack_pool[i].state == TrackState.Tracked]
-        dists = matching.iou_distance(r_tracked_stracks, detections_second)
-        matches, unmatched_trackers, u_detection_second = matching.linear_assignment(dists, thresh=0.5)
-        for itracked, idet in matches:
-            track = r_tracked_stracks[itracked]
-            det = detections_second[idet]
-            if track.state == TrackState.Tracked:
-                track.update(det, self.frame_id)
-                activated_starcks.append(track)
-            else:
-                track.re_activate(det, self.frame_id, new_id=False)
-                refind_stracks.append(track)
-
-        for it in unmatched_trackers:
-            track = r_tracked_stracks[it]
-            if not track.state == TrackState.Lost:
-                track.mark_lost()
-                lost_stracks.append(track)
-
-        """Deal with unconfirmed tracks, usually tracks with only one beginning frame"""
-        detections = [detections[i] for i in unmatched_detections]
-        dists = matching.iou_distance(unconfirmed, detections)
-        matches, u_unconfirmed, unmatched_detections = matching.linear_assignment(dists, thresh=0.7)
-        for itracked, idet in matches:
-            alp = dets_alpha[idet]
-            unconfirmed[itracked].update(detections[idet], self.frame_id)
-            unconfirmed[itracked].update_features(detections[idet].emb, alp)
-
-            activated_starcks.append(unconfirmed[itracked])
-        for it in u_unconfirmed:
-            track = unconfirmed[it]
-            track.mark_removed()
-            removed_stracks.append(track)
-
-        """ Step 4: Init new stracks"""
-        for inew in unmatched_detections:
-            track = detections[inew]
-            if track.score < self.det_thresh:
-                continue
-            # track.activate(self.kalman_filter, self.frame_id)
-            track.activate(self.frame_id)
-            activated_starcks.append(track)
-        """ Step 5: Update state"""
-        for track in self.lost_stracks:
-            if self.frame_id - track.end_frame > self.max_time_lost:
-                track.mark_removed()
-                removed_stracks.append(track)
-
-        # TODO: Reimplement lifetime management and what tracks are given out
-        self.tracked_stracks = [t for t in self.tracked_stracks if t.state == TrackState.Tracked]
-        self.tracked_stracks = joint_stracks(self.tracked_stracks, activated_starcks)
-        self.tracked_stracks = joint_stracks(self.tracked_stracks, refind_stracks)
-        self.lost_stracks = sub_stracks(self.lost_stracks, self.tracked_stracks)
-        self.lost_stracks.extend(lost_stracks)
-        self.lost_stracks = sub_stracks(self.lost_stracks, self.removed_stracks)
-        self.removed_stracks.extend(removed_stracks)
-        self.tracked_stracks, self.lost_stracks = remove_duplicate_stracks(self.tracked_stracks, self.lost_stracks)
-        # get scores of lost tracks
-        output_stracks = [track for track in self.tracked_stracks if track.is_activated]
-
-        return output_stracks
-
-
-def joint_stracks(tlista, tlistb):
-    exists = {}
-    res = []
-    for t in tlista:
-        exists[t.track_id] = 1
-        res.append(t)
-    for t in tlistb:
-        tid = t.track_id
-        if not exists.get(tid, 0):
-            exists[tid] = 1
-            res.append(t)
-    return res
-
-
-def sub_stracks(tlista, tlistb):
-    stracks = {}
-    for t in tlista:
-        stracks[t.track_id] = t
-    for t in tlistb:
-        tid = t.track_id
-        if stracks.get(tid, 0):
-            del stracks[tid]
-    return list(stracks.values())
-
-
-def remove_duplicate_stracks(stracksa, stracksb):
-    pdist = matching.iou_distance(stracksa, stracksb)
-    pairs = np.where(pdist < 0.15)
-    # pairs = np.where(pdist < 0.)
-    dupa, dupb = list(), list()
-    for p, q in zip(*pairs):
-        timep = stracksa[p].frame_id - stracksa[p].start_frame
-        timeq = stracksb[q].frame_id - stracksb[q].start_frame
-        if timep > timeq:
-            dupb.append(q)
-        else:
-            dupa.append(p)
-    resa = [t for i, t in enumerate(stracksa) if not i in dupa]
-    resb = [t for i, t in enumerate(stracksb) if not i in dupb]
-    return resa, resb
